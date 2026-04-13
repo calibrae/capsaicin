@@ -947,6 +947,389 @@ fn decode_one_pixel(
     Ok(())
 }
 
+// ============================================================
+// QUIC encoder — symmetric to the decoder, lets us round-trip-test
+// the per-channel adaptive coder including the RLE branch.
+// ============================================================
+
+/// Bit-writer dual to [`BitReader`]. Bits accumulate into `io_word`
+/// MSB-first; once 32 are pending the word is emitted as little-endian
+/// to `buf`, matching the decoder's word-load convention.
+pub struct BitWriter {
+    buf: Vec<u8>,
+    /// Bits accumulated so far (MSB-aligned).
+    io_word: u32,
+    /// LSB-side bits still free (32 = empty, 0 = ready to flush).
+    available: u32,
+}
+
+impl Default for BitWriter {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl BitWriter {
+    pub fn new() -> Self {
+        Self {
+            buf: Vec::new(),
+            io_word: 0,
+            available: 32,
+        }
+    }
+
+    /// Write `len` LSB-aligned bits of `word`.
+    pub fn write(&mut self, word: u32, len: u32) {
+        debug_assert!(len > 0 && len < 32);
+        debug_assert!(word & !bppmask(len) == 0);
+        if len < self.available {
+            self.available -= len;
+            self.io_word |= word << self.available;
+            return;
+        }
+        let delta = len - self.available;
+        self.io_word |= word >> delta;
+        self.flush_word();
+        self.available = 32 - delta;
+        self.io_word = if delta == 0 {
+            0
+        } else {
+            word.wrapping_shl(self.available)
+        };
+    }
+
+    fn flush_word(&mut self) {
+        self.buf.extend_from_slice(&self.io_word.to_le_bytes());
+        self.io_word = 0;
+        self.available = 32;
+    }
+
+    /// Finalise the stream and return the byte buffer.
+    pub fn finish(mut self) -> Vec<u8> {
+        if self.available != 32 {
+            self.flush_word();
+        }
+        self.buf
+    }
+
+    /// Emit `n` consecutive 1-bits.
+    pub fn write_ones(&mut self, n: u32) {
+        let mut remaining = n;
+        while remaining >= 31 {
+            self.write(bppmask(31), 31);
+            remaining -= 31;
+        }
+        if remaining > 0 {
+            self.write(bppmask(remaining), remaining);
+        }
+    }
+}
+
+impl Family {
+    /// Encode symbol `n` at code `l`. Returns `(codeword, len)`.
+    pub fn golomb_encode(&self, n: u8, l: u32) -> (u32, u32) {
+        let l_idx = l as usize;
+        let nv = n as u32;
+        if nv < self.n_gr_codewords[l_idx] {
+            // Standard GR: `(n >> l)` zeros then a 1 then `l`-bit
+            // suffix carrying `n & mask`.
+            let codeword = (1u32 << l) | (nv & bppmask(l));
+            let len = (nv >> l) + l + 1;
+            (codeword, len)
+        } else {
+            // Escape: fixed `notGRcwlen[l]` bits encoding the value
+            // offset by `nGRcodewords[l]`.
+            let value = nv - self.n_gr_codewords[l_idx];
+            (value, self.not_gr_cwlen[l_idx])
+        }
+    }
+}
+
+/// Mirror of [`decode_state_run`] for the encoder side.
+pub fn encode_state_run(writer: &mut BitWriter, state: &mut CommonState, mut runlen: u32) {
+    let mut hits = 0u32;
+    while runlen >= state.melcorder {
+        hits += 1;
+        runlen -= state.melcorder;
+        if (state.melcstate as usize) < MELCSTATES - 1 {
+            state.melcstate += 1;
+            state.melclen = J_TABLE[state.melcstate as usize];
+            state.melcorder = 1u32 << state.melclen;
+        }
+    }
+    writer.write_ones(hits);
+    let trailing_len = (state.melclen as u32) + 1;
+    writer.write(runlen, trailing_len);
+    if state.melcstate > 0 {
+        state.melcstate -= 1;
+        state.melclen = J_TABLE[state.melcstate as usize];
+        state.melcorder = 1u32 << state.melclen;
+    }
+}
+
+/// Top-level entry: compress a `width × height` BGRA buffer (top-down,
+/// alpha ignored) into a complete QUIC RGB32 stream including the
+/// 5-word header.
+pub fn compress_rgb32(pixels: &[u8], width: u32, height: u32) -> Vec<u8> {
+    assert_eq!(pixels.len(), (width * height * 4) as usize);
+    let mut header = Vec::with_capacity(QUIC_HEADER_SIZE);
+    QuicHeader {
+        image_type: QuicImageType::Rgb32,
+        width,
+        height,
+    }
+    .encode(&mut header);
+
+    let family = Family::init(8);
+    let mut state = CommonState::default();
+    state.reset_rle();
+    let mut chan_r = ChannelDecoder::new(8, width as usize);
+    let mut chan_g = ChannelDecoder::new(8, width as usize);
+    let mut chan_b = ChannelDecoder::new(8, width as usize);
+    let mut writer = BitWriter::new();
+    let stride = (width as usize) * 4;
+
+    compress_row_rgb32(
+        &mut writer,
+        &family,
+        &mut state,
+        &mut chan_r,
+        &mut chan_g,
+        &mut chan_b,
+        None,
+        &pixels[..stride],
+        width,
+    );
+    chan_r.prev_minus1 = chan_r.correlate_row[0];
+    chan_g.prev_minus1 = chan_g.correlate_row[0];
+    chan_b.prev_minus1 = chan_b.correlate_row[0];
+
+    for row in 1..height as usize {
+        let prev = &pixels[(row - 1) * stride..row * stride];
+        let cur = &pixels[row * stride..(row + 1) * stride];
+        compress_row_rgb32(
+            &mut writer,
+            &family,
+            &mut state,
+            &mut chan_r,
+            &mut chan_g,
+            &mut chan_b,
+            Some(prev),
+            cur,
+            width,
+        );
+        chan_r.prev_minus1 = chan_r.correlate_row[0];
+        chan_g.prev_minus1 = chan_g.correlate_row[0];
+        chan_b.prev_minus1 = chan_b.correlate_row[0];
+    }
+
+    let body = writer.finish();
+    header.extend(body);
+    header
+}
+
+#[allow(clippy::too_many_arguments)]
+fn compress_row_rgb32(
+    writer: &mut BitWriter,
+    family: &Family,
+    state: &mut CommonState,
+    chan_r: &mut ChannelDecoder,
+    chan_g: &mut ChannelDecoder,
+    chan_b: &mut ChannelDecoder,
+    prev: Option<&[u8]>,
+    cur: &[u8],
+    width: u32,
+) {
+    let mask = bppmask(family.bpc);
+    let mut pos = 0u32;
+    let mut remaining = width;
+    while DEFWMIMAX > state.wmidx && state.wmileft <= remaining {
+        if state.wmileft > 0 {
+            let end = pos + state.wmileft;
+            compress_seg_rgb32(
+                writer, family, state, chan_r, chan_g, chan_b, prev, cur, pos, end, mask,
+            );
+            pos += state.wmileft;
+            remaining -= state.wmileft;
+        }
+        state.wmidx += 1;
+        state.set_wm_trigger();
+        state.wmileft = DEFWMINEXT;
+    }
+    if remaining > 0 {
+        let end = pos + remaining;
+        compress_seg_rgb32(
+            writer, family, state, chan_r, chan_g, chan_b, prev, cur, pos, end, mask,
+        );
+        if DEFWMIMAX > state.wmidx {
+            state.wmileft = state.wmileft.wrapping_sub(remaining);
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn compress_seg_rgb32(
+    writer: &mut BitWriter,
+    family: &Family,
+    state: &mut CommonState,
+    chan_r: &mut ChannelDecoder,
+    chan_g: &mut ChannelDecoder,
+    chan_b: &mut ChannelDecoder,
+    prev: Option<&[u8]>,
+    cur: &[u8],
+    start: u32,
+    end: u32,
+    mask: u32,
+) {
+    debug_assert!(end > start);
+    let waitmask = bppmask(state.wmidx);
+    let mut i = start;
+    let mut stopidx;
+    let mut run_index: i64 = -1;
+
+    if i == 0 {
+        encode_one_pixel_pos0(writer, family, chan_r, chan_g, chan_b, prev, cur);
+        if state.waitcnt > 0 {
+            state.waitcnt -= 1;
+        } else {
+            state.waitcnt = tabrand(&mut state.tabrand_seed) & waitmask;
+            update_models_at(family, state, chan_r, chan_g, chan_b, 0);
+        }
+        i += 1;
+        stopidx = i + state.waitcnt;
+    } else {
+        stopidx = i + state.waitcnt;
+    }
+
+    'outer: loop {
+        while stopidx < end {
+            let mut j = i;
+            while j <= stopidx {
+                if encode_rle_match(prev, cur, j, run_index) {
+                    state.waitcnt = stopidx.wrapping_sub(j);
+                    run_index = j as i64;
+                    let mut run_size = 0u32;
+                    while j < end && same_bgr(cur, j as usize, cur, j as usize - 1) {
+                        run_size += 1;
+                        j += 1;
+                    }
+                    encode_state_run(writer, state, run_size);
+                    if j == end {
+                        return;
+                    }
+                    i = j;
+                    stopidx = i + state.waitcnt;
+                    continue 'outer;
+                }
+                encode_one_pixel(writer, family, chan_r, chan_g, chan_b, prev, cur, j, mask);
+                j += 1;
+            }
+            update_models_at(family, state, chan_r, chan_g, chan_b, stopidx);
+            i = stopidx + 1;
+            stopidx = i + (tabrand(&mut state.tabrand_seed) & waitmask);
+        }
+        let mut j = i;
+        while j < end {
+            if encode_rle_match(prev, cur, j, run_index) {
+                state.waitcnt = stopidx.wrapping_sub(j);
+                run_index = j as i64;
+                let mut run_size = 0u32;
+                while j < end && same_bgr(cur, j as usize, cur, j as usize - 1) {
+                    run_size += 1;
+                    j += 1;
+                }
+                encode_state_run(writer, state, run_size);
+                if j == end {
+                    return;
+                }
+                i = j;
+                stopidx = i + state.waitcnt;
+                continue 'outer;
+            }
+            encode_one_pixel(writer, family, chan_r, chan_g, chan_b, prev, cur, j, mask);
+            j += 1;
+        }
+        state.waitcnt = stopidx.wrapping_sub(end);
+        return;
+    }
+}
+
+/// Encoder-side RLE predicate. Same shape as the decoder's
+/// [`rle_match`]: only triggers past index 2, after we haven't just
+/// emerged from a run, when prev row's neighbours match and current
+/// row's previous two pixels match.
+fn encode_rle_match(prev_row: Option<&[u8]>, cur: &[u8], j: u32, run_index: i64) -> bool {
+    let Some(prev) = prev_row else {
+        return false;
+    };
+    if j <= 2 {
+        return false;
+    }
+    if run_index == j as i64 {
+        return false;
+    }
+    let i = j as usize;
+    same_bgr(prev, i - 1, prev, i) && same_bgr(cur, i - 1, cur, i - 2)
+}
+
+fn encode_one_pixel_pos0(
+    writer: &mut BitWriter,
+    family: &Family,
+    chan_r: &mut ChannelDecoder,
+    chan_g: &mut ChannelDecoder,
+    chan_b: &mut ChannelDecoder,
+    prev: Option<&[u8]>,
+    cur: &[u8],
+) {
+    for (chan, dst_byte_offset) in [(chan_r, 2usize), (chan_g, 1usize), (chan_b, 0usize)] {
+        let cur_val = cur[dst_byte_offset] as u32;
+        let predicted = if let Some(p) = prev {
+            p[dst_byte_offset] as u32
+        } else {
+            0 // first row, position 0: predictor is 0
+        };
+        let residual = family.xlat_u2l[((cur_val.wrapping_sub(predicted)) & 0xFF) as usize];
+        chan.correlate_row[0] = residual;
+        let prev_minus1 = chan.prev_minus1;
+        let bucket = chan.find_bucket(prev_minus1);
+        let l = bucket.bestcode as u32;
+        let (codeword, len) = family.golomb_encode(residual, l);
+        writer.write(codeword, len);
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn encode_one_pixel(
+    writer: &mut BitWriter,
+    family: &Family,
+    chan_r: &mut ChannelDecoder,
+    chan_g: &mut ChannelDecoder,
+    chan_b: &mut ChannelDecoder,
+    prev: Option<&[u8]>,
+    cur: &[u8],
+    i: u32,
+    mask: u32,
+) {
+    let pos = (i as usize) * 4;
+    for (chan, dst_byte_offset) in [(chan_r, 2usize), (chan_g, 1usize), (chan_b, 0usize)] {
+        let cur_val = cur[pos + dst_byte_offset] as u32;
+        let a = cur[pos - 4 + dst_byte_offset] as u32;
+        let predicted = if let Some(p) = prev {
+            let b = p[pos + dst_byte_offset] as u32;
+            (a + b) >> 1
+        } else {
+            a
+        };
+        let residual = family.xlat_u2l[((cur_val.wrapping_sub(predicted)) & mask) as usize];
+        chan.correlate_row[i as usize] = residual;
+        let bucket_val = chan.correlate_row[i as usize - 1];
+        let bucket = chan.find_bucket(bucket_val);
+        let l = bucket.bestcode as u32;
+        let (codeword, len) = family.golomb_encode(residual, l);
+        writer.write(codeword, len);
+    }
+}
+
 /// Decompress a QUIC RGBA stream into BGRA (top-down). RGBA is encoded
 /// as two streams concatenated: first an RGB32 stream filling B/G/R
 /// (alpha=0 from the RGB32 pass), then an alpha overlay stream that
@@ -1837,6 +2220,75 @@ mod body_tests {
 
         let pixels = decompress_rgb32(&buf, 1, 1).unwrap();
         assert_eq!(pixels, vec![0, 0, 0, 0]);
+    }
+
+    /// Round-trip a deterministic synthetic image through the encoder
+    /// and decoder. Validates the per-channel adaptive coder, the
+    /// model evolution, the waitcnt logic, and the bit-stream framing
+    /// end-to-end on a non-trivial pixel pattern.
+    #[test]
+    fn rgb32_round_trip_deterministic_pattern() {
+        let width = 16u32;
+        let height = 8u32;
+        let mut pixels = Vec::with_capacity((width * height * 4) as usize);
+        for y in 0..height {
+            for x in 0..width {
+                pixels.push(((x * 13 + y * 7) & 0xff) as u8); // B
+                pixels.push(((x * 11 + y * 23) & 0xff) as u8); // G
+                pixels.push(((x * 17 + y * 31) & 0xff) as u8); // R
+                pixels.push(0);
+            }
+        }
+        let stream = compress_rgb32(&pixels, width, height);
+        let decoded = decompress_rgb32(&stream, width, height).unwrap();
+        assert_eq!(
+            decoded, pixels,
+            "encoder/decoder round-trip mismatch for pattern image"
+        );
+    }
+
+    /// Solid-color image triggers the RLE branch (every pixel matches
+    /// the previous one). This is the case the QUIC body decoder's
+    /// `RLE_PRED_IMP` was structurally implemented for but never
+    /// exercised end-to-end before — encoder/decoder paired test
+    /// closes that gap.
+    #[test]
+    fn rgb32_round_trip_solid_color_exercises_rle() {
+        let width = 32u32;
+        let height = 16u32;
+        let mut pixels = Vec::with_capacity((width * height * 4) as usize);
+        for _ in 0..(width * height) {
+            pixels.push(0x42); // B
+            pixels.push(0x99); // G
+            pixels.push(0x10); // R
+            pixels.push(0);
+        }
+        let stream = compress_rgb32(&pixels, width, height);
+        let decoded = decompress_rgb32(&stream, width, height).unwrap();
+        assert_eq!(
+            decoded, pixels,
+            "RLE branch round-trip mismatch on solid-color image"
+        );
+    }
+
+    /// Multi-row gradient — exercises the cross-row (a + b) / 2
+    /// predictor.
+    #[test]
+    fn rgb32_round_trip_horizontal_and_vertical_gradient() {
+        let width = 24u32;
+        let height = 12u32;
+        let mut pixels = Vec::with_capacity((width * height * 4) as usize);
+        for y in 0..height {
+            for x in 0..width {
+                pixels.push((x * 8) as u8); // B (horizontal gradient)
+                pixels.push((y * 16) as u8); // G (vertical gradient)
+                pixels.push(((x + y) * 5) as u8); // R (diagonal)
+                pixels.push(0);
+            }
+        }
+        let stream = compress_rgb32(&pixels, width, height);
+        let decoded = decompress_rgb32(&stream, width, height).unwrap();
+        assert_eq!(decoded, pixels, "gradient image round-trip mismatch");
     }
 
     #[test]
