@@ -38,12 +38,41 @@ pub enum QuicError {
 
     #[error("invalid QUIC image type {0}")]
     BadImageType(u32),
+
+    #[error("image dimensions {width}×{height} exceed the configured cap")]
+    TooLarge { width: u32, height: u32 },
 }
 
 pub type Result<T> = std::result::Result<T, QuicError>;
 
 pub const QUIC_MAGIC: u32 = 0x4349_5551; // "QUIC"
 pub const QUIC_VERSION: u32 = 0; // major=0 minor=0
+
+/// Maximum image dimension we'll accept on either axis. A malicious
+/// peer could otherwise claim `width = height = 0xFFFFFFFF`, causing
+/// the output buffer allocator to wrap on 32-bit hosts and reserve
+/// 16 GiB on 64-bit ones.
+pub const MAX_IMAGE_DIM: u32 = 16384;
+/// Maximum decoded image size in bytes. Even at 32-bit BGRA the
+/// max-dim image (16384²) is 1 GiB; cap at 64 MiB so a single image
+/// can't dominate available memory.
+pub const MAX_IMAGE_BYTES: usize = 64 * 1024 * 1024;
+
+/// Validate `width × height × bpp` is non-overflowing and within
+/// `MAX_IMAGE_BYTES`.
+fn validate_dims(width: u32, height: u32, bpp: u32) -> Result<usize> {
+    if width == 0 || height == 0 || width > MAX_IMAGE_DIM || height > MAX_IMAGE_DIM {
+        return Err(QuicError::TooLarge { width, height });
+    }
+    let bytes = (width as usize)
+        .checked_mul(height as usize)
+        .and_then(|n| n.checked_mul(bpp as usize))
+        .ok_or(QuicError::TooLarge { width, height })?;
+    if bytes > MAX_IMAGE_BYTES {
+        return Err(QuicError::TooLarge { width, height });
+    }
+    Ok(bytes)
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u32)]
@@ -1335,6 +1364,7 @@ fn encode_one_pixel(
 /// (alpha=0 from the RGB32 pass), then an alpha overlay stream that
 /// overwrites byte 3 of every pixel using a separate adaptive coder.
 pub fn decompress_rgba(stream: &[u8], width: u32, height: u32) -> Result<Vec<u8>> {
+    validate_dims(width, height, 4)?;
     let mut reader = BitReader::new_after_header(stream)?;
     let family = Family::init(8);
 
@@ -1629,6 +1659,7 @@ fn update_alpha_model_at(
 /// + `lz_one_pixel_t`; we decode straight into a grayscale `Vec<u8>`
 /// and expand to BGRA at the end.
 pub fn decompress_gray(stream: &[u8], width: u32, height: u32) -> Result<Vec<u8>> {
+    validate_dims(width, height, 4)?;
     let mut reader = BitReader::new_after_header(stream)?;
     let family = Family::init(8);
     let mut state = CommonState::default();
@@ -1804,6 +1835,7 @@ fn update_alpha_model_at_byte(
 /// storage is RGB555 in a `Vec<u16>`; we expand each 5-bit channel to
 /// 8-bit at the end via the standard mirror-low-bits upsample.
 pub fn decompress_rgb16(stream: &[u8], width: u32, height: u32) -> Result<Vec<u8>> {
+    validate_dims(width, height, 4)?;
     let mut reader = BitReader::new_after_header(stream)?;
     let family = Family::init(5);
     let mut state = CommonState::default();
@@ -2045,6 +2077,7 @@ fn decode_rgb16_pixel(
 /// pixel; richer round-trip coverage and the RLE branch are the next
 /// iteration's work.
 pub fn decompress_rgb32(stream: &[u8], width: u32, height: u32) -> Result<Vec<u8>> {
+    validate_dims(width, height, 4)?;
     let mut reader = BitReader::new_after_header(stream)?;
     let family = Family::init(8);
     let mut state = CommonState::default();
@@ -2289,6 +2322,38 @@ mod body_tests {
         let stream = compress_rgb32(&pixels, width, height);
         let decoded = decompress_rgb32(&stream, width, height).unwrap();
         assert_eq!(decoded, pixels, "gradient image round-trip mismatch");
+    }
+
+    /// Hostile peer claiming an enormous image: decoder must reject
+    /// before allocating, not OOM.
+    #[test]
+    fn decompress_rgb32_rejects_oversize_dimensions() {
+        // Construct a header claiming 65535×65535 (≈16 GiB output).
+        let h = QuicHeader {
+            image_type: QuicImageType::Rgb32,
+            width: 65535,
+            height: 65535,
+        };
+        let mut buf = Vec::new();
+        h.encode(&mut buf);
+        // We don't even need a body — the dim check should fire first.
+        let res = decompress_rgb32(&buf, 65535, 65535);
+        assert!(matches!(res, Err(QuicError::TooLarge { .. })));
+    }
+
+    #[test]
+    fn decompress_rgb32_rejects_zero_dimension() {
+        let h = QuicHeader {
+            image_type: QuicImageType::Rgb32,
+            width: 0,
+            height: 100,
+        };
+        let mut buf = Vec::new();
+        h.encode(&mut buf);
+        assert!(matches!(
+            decompress_rgb32(&buf, 0, 100),
+            Err(QuicError::TooLarge { .. })
+        ));
     }
 
     #[test]

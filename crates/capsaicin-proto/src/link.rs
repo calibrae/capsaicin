@@ -13,6 +13,7 @@ use crate::enums::{
     ChannelType, LinkError, SPICE_MAGIC, SPICE_TICKET_PUBKEY_BYTES, SPICE_VERSION_MAJOR,
     SPICE_VERSION_MINOR,
 };
+use crate::limits::{MAX_CAPS_ENTRIES, bounded_count};
 use crate::{ProtoError, Result};
 
 pub const LINK_HEADER_SIZE: usize = 16;
@@ -57,6 +58,15 @@ impl LinkHeader {
         }
         let major_version = u32::from_le_bytes(buf[4..8].try_into().unwrap());
         let minor_version = u32::from_le_bytes(buf[8..12].try_into().unwrap());
+        // Major version mismatch means the peer speaks a different
+        // protocol generation entirely — refuse the handshake. We
+        // accept any minor (those are backwards-compatible by spec).
+        if major_version != SPICE_VERSION_MAJOR {
+            return Err(ProtoError::BadVersion {
+                major: major_version,
+                minor: minor_version,
+            });
+        }
         let size = u32::from_le_bytes(buf[12..16].try_into().unwrap());
         Ok(Self {
             magic,
@@ -101,8 +111,14 @@ impl LinkMess {
         let connection_id = u32::from_le_bytes(buf[0..4].try_into().unwrap());
         let channel_type = ChannelType::from_u8(buf[4])?;
         let channel_id = buf[5];
-        let num_common_caps = u32::from_le_bytes(buf[6..10].try_into().unwrap()) as usize;
-        let num_channel_caps = u32::from_le_bytes(buf[10..14].try_into().unwrap()) as usize;
+        let num_common_caps = bounded_count(
+            u32::from_le_bytes(buf[6..10].try_into().unwrap()),
+            MAX_CAPS_ENTRIES,
+        )?;
+        let num_channel_caps = bounded_count(
+            u32::from_le_bytes(buf[10..14].try_into().unwrap()),
+            MAX_CAPS_ENTRIES,
+        )?;
         let caps_offset = u32::from_le_bytes(buf[14..18].try_into().unwrap()) as usize;
 
         let common_caps = read_caps(buf, caps_offset, num_common_caps)?;
@@ -157,10 +173,14 @@ impl LinkReply {
         let mut pub_key = [0u8; SPICE_TICKET_PUBKEY_BYTES];
         pub_key.copy_from_slice(&buf[4..pk_end]);
 
-        let num_common_caps =
-            u32::from_le_bytes(buf[pk_end..pk_end + 4].try_into().unwrap()) as usize;
-        let num_channel_caps =
-            u32::from_le_bytes(buf[pk_end + 4..pk_end + 8].try_into().unwrap()) as usize;
+        let num_common_caps = bounded_count(
+            u32::from_le_bytes(buf[pk_end..pk_end + 4].try_into().unwrap()),
+            MAX_CAPS_ENTRIES,
+        )?;
+        let num_channel_caps = bounded_count(
+            u32::from_le_bytes(buf[pk_end + 4..pk_end + 8].try_into().unwrap()),
+            MAX_CAPS_ENTRIES,
+        )?;
         let caps_offset =
             u32::from_le_bytes(buf[pk_end + 8..pk_end + 12].try_into().unwrap()) as usize;
 

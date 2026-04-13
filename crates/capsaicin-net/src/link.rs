@@ -2,6 +2,7 @@
 
 use capsaicin_proto::caps::{self, CapSet};
 use capsaicin_proto::enums::{ChannelType, LinkError};
+use capsaicin_proto::limits::{MAX_LINK_PAYLOAD, bounded_size};
 use capsaicin_proto::link::{
     ENCRYPTED_TICKET_SIZE, LINK_HEADER_SIZE, LINK_RESULT_SIZE, LinkHeader, LinkMess, LinkReply,
     LinkResult,
@@ -60,8 +61,10 @@ where
     stream.read_exact(&mut hdr_buf).await?;
     let hdr = LinkHeader::decode(&hdr_buf)?;
 
-    // 3. Read the LinkReply (fixed part + caps).
-    let mut reply_buf = vec![0u8; hdr.size as usize];
+    // 3. Read the LinkReply (fixed part + caps). Cap before allocating
+    // — a malicious server could send `size = 0xFFFFFFFF`.
+    let reply_size = bounded_size(hdr.size, MAX_LINK_PAYLOAD)?;
+    let mut reply_buf = vec![0u8; reply_size];
     stream.read_exact(&mut reply_buf).await?;
     let reply = LinkReply::decode(&reply_buf)?;
     if reply.error != LinkError::Ok {

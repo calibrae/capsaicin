@@ -156,9 +156,33 @@ pub enum GlzError {
     /// Underlying LZ enum failed to recognise the stream's image type.
     #[error("lz image type: {0}")]
     Lz(#[from] LzError),
+
+    #[error("image dimensions {width}×{height} exceed the configured cap")]
+    TooLarge { width: u32, height: u32 },
 }
 
 pub type Result<T> = std::result::Result<T, GlzError>;
+
+/// Maximum image dimension we'll accept on either axis.
+pub const MAX_IMAGE_DIM: u32 = 16384;
+/// Maximum decoded image size in bytes.
+pub const MAX_IMAGE_BYTES: usize = 64 * 1024 * 1024;
+
+/// Validate `width × height × bpp` is non-overflowing and within
+/// `MAX_IMAGE_BYTES`. Returns the byte count.
+pub fn validate_dims(width: u32, height: u32, bpp: u32) -> Result<usize> {
+    if width == 0 || height == 0 || width > MAX_IMAGE_DIM || height > MAX_IMAGE_DIM {
+        return Err(GlzError::TooLarge { width, height });
+    }
+    let bytes = (width as usize)
+        .checked_mul(height as usize)
+        .and_then(|n| n.checked_mul(bpp as usize))
+        .ok_or(GlzError::TooLarge { width, height })?;
+    if bytes > MAX_IMAGE_BYTES {
+        return Err(GlzError::TooLarge { width, height });
+    }
+    Ok(bytes)
+}
 
 /// Per-session image dictionary. GLZ back-references can target any
 /// image still in the window via `target_id = current_id - image_dist`.
@@ -281,6 +305,7 @@ fn decompress_rgb32_inner(
     window: Option<&GlzWindow>,
     self_id: u64,
 ) -> std::result::Result<Vec<u8>, GlzError> {
+    validate_dims(header.width, header.height, 4)?;
     if header.image_type != LzImageType::Rgb32 {
         return Err(GlzError::UnsupportedType(header.image_type));
     }

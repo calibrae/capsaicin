@@ -50,9 +50,33 @@ pub enum LzError {
 
     #[error("invalid LZ image type {0}")]
     BadImageType(u32),
+
+    #[error("image dimensions {width}×{height} exceed the configured cap")]
+    TooLarge { width: u32, height: u32 },
 }
 
 pub type Result<T> = std::result::Result<T, LzError>;
+
+/// Maximum image dimension we'll accept on either axis.
+pub const MAX_IMAGE_DIM: u32 = 16384;
+/// Maximum decoded image size in bytes.
+pub const MAX_IMAGE_BYTES: usize = 64 * 1024 * 1024;
+
+/// Validate `width × height × bpp` is non-overflowing and within
+/// `MAX_IMAGE_BYTES`. Returns the byte count.
+pub fn validate_dims(width: u32, height: u32, bpp: u32) -> Result<usize> {
+    if width == 0 || height == 0 || width > MAX_IMAGE_DIM || height > MAX_IMAGE_DIM {
+        return Err(LzError::TooLarge { width, height });
+    }
+    let bytes = (width as usize)
+        .checked_mul(height as usize)
+        .and_then(|n| n.checked_mul(bpp as usize))
+        .ok_or(LzError::TooLarge { width, height })?;
+    if bytes > MAX_IMAGE_BYTES {
+        return Err(LzError::TooLarge { width, height });
+    }
+    Ok(bytes)
+}
 
 pub const LZ_MAGIC: u32 = 0x2020_5a4c; // "LZ  "
 pub const LZ_VERSION: u32 = 0x0001_0001; // major=1 minor=1
@@ -281,6 +305,7 @@ fn decompress_pass(
 
 /// Decompress an LZ_RGB32 stream into a new BGRA buffer (`pad = 0`).
 pub fn decompress_rgb32(stream: &[u8], num_pixels: usize) -> Result<Vec<u8>> {
+    bounded_pixels(num_pixels)?;
     let mut out = vec![0u8; num_pixels * 4];
     let _ = decompress_pass(stream, num_pixels, &mut out, Stage::Bgr)?;
     Ok(out)
@@ -288,10 +313,30 @@ pub fn decompress_rgb32(stream: &[u8], num_pixels: usize) -> Result<Vec<u8>> {
 
 /// Decompress an LZ_RGBA stream: BGR pass first, then alpha overlay.
 pub fn decompress_rgba(stream: &[u8], num_pixels: usize) -> Result<Vec<u8>> {
+    bounded_pixels(num_pixels)?;
     let mut out = vec![0u8; num_pixels * 4];
     let consumed = decompress_pass(stream, num_pixels, &mut out, Stage::Bgr)?;
     let _ = decompress_pass(&stream[consumed..], num_pixels, &mut out, Stage::Alpha)?;
     Ok(out)
+}
+
+/// Validate `num_pixels * 4` is within `MAX_IMAGE_BYTES` and doesn't
+/// overflow `usize` on the way there.
+fn bounded_pixels(num_pixels: usize) -> Result<()> {
+    if num_pixels == 0 {
+        return Err(LzError::TooLarge { width: 0, height: 0 });
+    }
+    let bytes = num_pixels.checked_mul(4).ok_or(LzError::TooLarge {
+        width: 0,
+        height: 0,
+    })?;
+    if bytes > MAX_IMAGE_BYTES {
+        return Err(LzError::TooLarge {
+            width: num_pixels.min(u32::MAX as usize) as u32,
+            height: 0,
+        });
+    }
+    Ok(())
 }
 
 // --------- minimal compressor used only by tests / fuzzers ----------

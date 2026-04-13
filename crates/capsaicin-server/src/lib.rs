@@ -2,15 +2,24 @@
 //!
 //! Provides the pieces an application needs to accept SPICE clients:
 //!
-//! - [`Server`]: owns the RSA key, password, and session-id counter.
-//! - [`Server::accept`]: runs the link handshake on a stream.
-//! - [`serve_main_bootstrap`]: drives the post-link bootstrap of the main
-//!   channel (`MAIN_INIT`, `CLIENT_INFO`/`ATTACH_CHANNELS`, `CHANNELS_LIST`).
+//! - [`Server`]: owns the RSA key, password, and live-session table.
+//! - [`Server::accept`]: runs the link handshake on a stream. The
+//!   returned [`AcceptedLink`] carries the client-claimed
+//!   `connection_id`; for a sub-channel attach you **must** validate
+//!   it via [`Server::is_live_session`] before honouring it, otherwise
+//!   any peer who knows the password can hijack another client's
+//!   sub-channels by guessing their session id.
+//! - [`Server::register_session`] / [`Server::end_session`]: the
+//!   embedder's hooks into the session table.
+//! - [`serve_main_bootstrap`]: drives the post-link bootstrap of the
+//!   main channel (`MAIN_INIT`, `CLIENT_INFO`/`ATTACH_CHANNELS`,
+//!   `CHANNELS_LIST`).
 //!
-//! Sub-channel dispatch, surface creation, frame generation — all left to
-//! the embedder. The library is deliberately thin.
+//! Sub-channel dispatch, surface creation, frame generation — all left
+//! to the embedder. The library is deliberately thin.
 
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::collections::HashSet;
+use std::sync::Mutex;
 
 use capsaicin_net::{AcceptedLink, Channel, ServerLinkOptions, link_server};
 use capsaicin_proto::common;
@@ -19,6 +28,7 @@ use capsaicin_proto::enums::{
 };
 use capsaicin_proto::main_chan::{self, ChannelsList, Init};
 use capsaicin_proto::types::{ChannelId, Writer};
+use rand::RngCore;
 use rand::rngs::OsRng;
 use rsa::RsaPrivateKey;
 use tokio::io::{AsyncRead, AsyncWrite};
@@ -29,7 +39,11 @@ pub type Result<T> = std::result::Result<T, NetError>;
 pub struct Server {
     priv_key: RsaPrivateKey,
     password: String,
-    next_session_id: AtomicU32,
+    /// Set of session ids currently in use. Populated by
+    /// [`register_session`], drained by [`end_session`], consulted by
+    /// [`is_live_session`]. Sub-channel link-accepts MUST check this
+    /// before honouring a client-supplied `connection_id`.
+    live_sessions: Mutex<HashSet<u32>>,
 }
 
 impl Server {
@@ -45,22 +59,62 @@ impl Server {
         Self {
             priv_key,
             password: password.into(),
-            next_session_id: AtomicU32::new(1),
+            live_sessions: Mutex::new(HashSet::new()),
         }
     }
 
-    pub fn password(&self) -> &str {
-        &self.password
-    }
-
-    /// Allocate a new session id. Session ids must be non-zero so clients
+    /// Allocate a new, cryptographically-random session id and add it
+    /// to the live-session set. Session ids must be non-zero so clients
     /// can distinguish "new session" from "reattach" semantics.
+    ///
+    /// Random rather than sequential: a sequential counter would let an
+    /// attacker who learned one session id (returned in `MAIN_INIT`)
+    /// guess every other session id and try to attach sub-channels to
+    /// them.
     pub fn new_session_id(&self) -> u32 {
-        let mut id = self.next_session_id.fetch_add(1, Ordering::Relaxed);
-        if id == 0 {
-            id = self.next_session_id.fetch_add(1, Ordering::Relaxed);
+        let mut id;
+        loop {
+            id = OsRng.next_u32();
+            if id == 0 {
+                continue;
+            }
+            let mut live = self.live_sessions.lock().expect("session table poisoned");
+            if live.insert(id) {
+                break;
+            }
+            // Collision (~1 in 4 billion) — pick another.
         }
         id
+    }
+
+    /// Register an externally-allocated session id (e.g. one a
+    /// reattaching client claimed and the embedder accepted by some
+    /// other policy). Returns `false` if it was already live.
+    pub fn register_session(&self, id: u32) -> bool {
+        if id == 0 {
+            return false;
+        }
+        let mut live = self.live_sessions.lock().expect("session table poisoned");
+        live.insert(id)
+    }
+
+    /// Mark a session as no longer live (call when the main-channel
+    /// connection ends). Subsequent sub-channel attaches with the same
+    /// id will be refused by [`is_live_session`].
+    pub fn end_session(&self, id: u32) {
+        let mut live = self.live_sessions.lock().expect("session table poisoned");
+        live.remove(&id);
+    }
+
+    /// True iff `id` is currently in the live-session set. Sub-channel
+    /// accept paths must consult this before honouring a client-
+    /// supplied `connection_id`.
+    pub fn is_live_session(&self, id: u32) -> bool {
+        if id == 0 {
+            return false;
+        }
+        let live = self.live_sessions.lock().expect("session table poisoned");
+        live.contains(&id)
     }
 
     /// Accept a single client stream — runs the link handshake only.

@@ -610,15 +610,19 @@ fn decode_glz(
             // Store zero pixels so subsequent images can still reference
             // *this* one. Visually wrong colour but geometry stays
             // synchronised, preventing whole-screen cascade failures.
-            let placeholder = vec![0u8; (hdr.width * hdr.height * 4) as usize];
-            state.glz_window.insert(hdr.id, placeholder, 4);
+            // Use checked arithmetic and a cap to defend against a
+            // malicious server triggering a multi-GiB placeholder.
+            if let Some(placeholder) = bounded_placeholder(hdr.width, hdr.height) {
+                state.glz_window.insert(hdr.id, placeholder, 4);
+            }
             unhandled(display_msg::DRAW_COPY, msg.body.len())
         }
         Err(e) => {
             tracing::debug!(%e, "glz: body decode failed");
             // Same placeholder strategy for any other decode failure.
-            let placeholder = vec![0u8; (hdr.width * hdr.height * 4) as usize];
-            state.glz_window.insert(hdr.id, placeholder, 4);
+            if let Some(placeholder) = bounded_placeholder(hdr.width, hdr.height) {
+                state.glz_window.insert(hdr.id, placeholder, 4);
+            }
             unhandled(display_msg::DRAW_COPY, msg.body.len())
         }
     }
@@ -830,6 +834,24 @@ fn flip_vertical(rows: &[u8], stride: usize, height: usize) -> Vec<u8> {
         out.extend_from_slice(&rows[y * stride..(y + 1) * stride]);
     }
     out
+}
+
+/// Allocate a zero-byte placeholder for a GLZ image whose decode
+/// failed, but **only** if the geometry is sane. Returns `None` if
+/// the dimensions overflow or exceed our caps so a malicious server
+/// can't trigger multi-GiB allocations through repeated decode
+/// failures. 64 MiB cap matches the codec crates' MAX_IMAGE_BYTES.
+fn bounded_placeholder(width: u32, height: u32) -> Option<Vec<u8>> {
+    if width == 0 || height == 0 || width > 16384 || height > 16384 {
+        return None;
+    }
+    let bytes = (width as usize)
+        .checked_mul(height as usize)
+        .and_then(|n| n.checked_mul(4))?;
+    if bytes > 64 * 1024 * 1024 {
+        return None;
+    }
+    Some(vec![0u8; bytes])
 }
 
 fn unhandled(msg_type: u16, size: usize) -> DisplayEvent {

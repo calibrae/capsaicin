@@ -25,6 +25,7 @@
 //! This module only parses the `BITMAP` branch today; compressed branches
 //! (`QUIC`, `LZ_RGB`, `LZ4`, `JPEG`, ...) are recognised but not decoded.
 
+use crate::limits::{MAX_CHUNK_BYTES, MAX_CHUNK_COUNT, bounded_count, bounded_size};
 use crate::types::{Reader, Writer};
 use crate::{ProtoError, Result};
 
@@ -164,11 +165,14 @@ pub fn read_chunks(msg_body: &[u8], offset: u32) -> Result<Vec<u8>> {
         });
     }
     let mut r = Reader::new(&msg_body[start..]);
-    let data_size = r.u32()? as usize;
-    let num_chunks = r.u32()? as usize;
+    // Cap both before allocating: a malicious peer could claim
+    // data_size = 0xFFFFFFFF (4 GiB reservation) or num_chunks =
+    // 0xFFFFFFFF (4 billion-iteration loop) here.
+    let data_size = bounded_size(r.u32()?, MAX_CHUNK_BYTES)?;
+    let num_chunks = bounded_count(r.u32()?, MAX_CHUNK_COUNT)?;
     let mut out = Vec::with_capacity(data_size);
     for _ in 0..num_chunks {
-        let len = r.u32()? as usize;
+        let len = bounded_size(r.u32()?, MAX_CHUNK_BYTES)?;
         let bytes = r.bytes(len)?;
         out.extend_from_slice(bytes);
     }

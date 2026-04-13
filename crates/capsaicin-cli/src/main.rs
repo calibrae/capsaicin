@@ -50,17 +50,36 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     match subcommand.as_str() {
         "connect" => {
             let addr = args.next().unwrap_or_else(|| print_usage_and_exit());
-            let password = parse_password_flag(args);
+            let password = parse_password_flag(args).unwrap_or_default();
             connect_flow(&addr, &password).await
         }
         "serve" => {
             let addr = args.next().unwrap_or_else(|| print_usage_and_exit());
-            let password = parse_password_flag(args);
+            // Refuse to start without an explicit password decision: the
+            // server has no auth other than the password, and silently
+            // launching with no auth is a footgun.
+            let password = match parse_password_flag(args) {
+                Some(p) => {
+                    if p.is_empty() {
+                        tracing::warn!(
+                            "serve: started with empty password — server accepts any client"
+                        );
+                    }
+                    p
+                }
+                None => {
+                    eprintln!(
+                        "error: 'serve' requires --password VALUE (use --password '' to \
+                         explicitly opt in to no authentication)"
+                    );
+                    std::process::exit(2);
+                }
+            };
             serve_flow(&addr, &password).await
         }
         "view" => {
             let addr = args.next().unwrap_or_else(|| print_usage_and_exit());
-            let password = parse_password_flag(args);
+            let password = parse_password_flag(args).unwrap_or_default();
             // The viewer creates its own tokio runtime in a sidecar
             // thread and owns the main thread for winit. We invoke it
             // synchronously here.
@@ -78,13 +97,22 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     }
 }
 
-fn parse_password_flag<I: Iterator<Item = String>>(mut args: I) -> String {
+/// Returns `Some(pw)` if `--password VAL` was passed (VAL may be the
+/// empty string explicitly with `--password ''`), `None` otherwise.
+/// Errors out if `--password` was given without a value.
+fn parse_password_flag<I: Iterator<Item = String>>(mut args: I) -> Option<String> {
     while let Some(a) = args.next() {
         if a == "--password" || a == "-p" {
-            return args.next().unwrap_or_default();
+            match args.next() {
+                Some(v) => return Some(v),
+                None => {
+                    eprintln!("error: {a} requires a value (use '' for empty)");
+                    std::process::exit(2);
+                }
+            }
         }
     }
-    String::new()
+    None
 }
 
 fn print_usage_and_exit() -> ! {
@@ -224,15 +252,31 @@ fn log_display_event(evt: &DisplayEvent) {
     }
 }
 
+/// Cap on simultaneously-handled client connections. Without this an
+/// attacker can open thousands of TCP sockets, each costing a 4 KiB
+/// link-payload allocation + a tokio task, until the host runs out of
+/// FDs or memory.
+const MAX_CONCURRENT_CONNS: usize = 64;
+
 async fn serve_flow(addr: &str, password: &str) -> Result<(), Box<dyn std::error::Error>> {
     let server = Arc::new(Server::new(password)?);
     let listener = TcpListener::bind(addr).await?;
+    let limit = Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_CONNS));
     tracing::info!(%addr, "capsaicin serving SPICE");
 
     loop {
         let (stream, peer) = listener.accept().await?;
+        let permit = match limit.clone().try_acquire_owned() {
+            Ok(p) => p,
+            Err(_) => {
+                tracing::warn!(%peer, "rejecting connection: at capacity");
+                drop(stream);
+                continue;
+            }
+        };
         let server = server.clone();
         tokio::spawn(async move {
+            let _permit = permit; // drop releases the slot
             if let Err(e) = handle_server_conn(server, stream, peer.to_string()).await {
                 tracing::warn!(%peer, %e, "connection ended with error");
             }
@@ -245,7 +289,18 @@ async fn handle_server_conn(
     stream: tokio::net::TcpStream,
     peer: String,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let accepted = server.accept(stream).await?;
+    let accepted = match server.accept(stream).await {
+        Ok(a) => a,
+        Err(capsaicin_server::NetError::Link(
+            capsaicin_proto::enums::LinkError::PermissionDenied,
+        )) => {
+            // Loud, dedicated log for failed auth so brute-force shows
+            // up clearly in metrics-style log scraping.
+            tracing::warn!(%peer, "auth: password rejected");
+            return Ok(());
+        }
+        Err(e) => return Err(e.into()),
+    };
     tracing::info!(
         %peer,
         connection_id = accepted.connection_id,
@@ -257,19 +312,34 @@ async fn handle_server_conn(
 
     match accepted.channel_type {
         ChannelType::Main => {
-            let session_id = if accepted.connection_id == 0 {
-                server.new_session_id()
-            } else {
-                accepted.connection_id
-            };
+            // Always allocate a fresh random session id rather than
+            // honouring whatever the client claimed — a sequential or
+            // attacker-supplied id could be used to hijack another
+            // user's sub-channels.
+            let session_id = server.new_session_id();
             let mut ch = accepted.channel;
             serve_main_bootstrap(&mut ch, session_id, &default_channels(), None).await?;
             tracing::info!(%peer, session_id, "main channel attached; idling");
             while let Ok(m) = ch.read_message().await {
                 tracing::debug!(%peer, msg_type = m.msg_type, "rx");
             }
+            server.end_session(session_id);
         }
         _ => {
+            // Reject sub-channel attaches for sessions we don't know
+            // about. Without this any peer with the password could
+            // open Display/Inputs sub-channels for a session id they
+            // guessed (sequential ids made guessing trivial; even with
+            // random ids we still want defence-in-depth).
+            if !server.is_live_session(accepted.connection_id) {
+                tracing::warn!(
+                    %peer,
+                    connection_id = accepted.connection_id,
+                    channel_type = ?accepted.channel_type,
+                    "sub-channel attach refused: session id not live"
+                );
+                return Ok(());
+            }
             let mut ch = accepted.channel;
             tracing::info!(%peer, channel_type = ?accepted.channel_type, "sub-channel opened; idling");
             while let Ok(m) = ch.read_message().await {

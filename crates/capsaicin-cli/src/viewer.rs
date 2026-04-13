@@ -277,9 +277,17 @@ impl ViewerApp {
         if w == self.fb_w && h == self.fb_h {
             return;
         }
+        // Guard against a malicious server claiming SurfaceCreated with
+        // 65536×65536 (u32 multiply wraps to 0; subsequent indexing
+        // would panic). Cap at 16384 per axis / 256 MiB total.
+        let pixels = (w as u64).checked_mul(h as u64).unwrap_or(0);
+        if w == 0 || h == 0 || w > 16384 || h > 16384 || pixels > 64 * 1024 * 1024 {
+            tracing::warn!(w, h, "viewer: SurfaceCreated dimensions out of range, ignoring");
+            return;
+        }
         self.fb_w = w;
         self.fb_h = h;
-        self.fb = vec![0u32; (w * h) as usize];
+        self.fb = vec![0u32; pixels as usize];
     }
 
     fn fill_rect(&mut self, rect: Rect, color: u32) {

@@ -2,6 +2,7 @@
 
 use capsaicin_proto::caps::{self, CapSet};
 use capsaicin_proto::enums::{ChannelType, LinkError, SPICE_TICKET_PUBKEY_BYTES};
+use capsaicin_proto::limits::{MAX_LINK_PAYLOAD, bounded_size};
 use capsaicin_proto::link::{
     ENCRYPTED_TICKET_SIZE, LINK_HEADER_SIZE, LinkHeader, LinkMess, LinkReply, LinkResult,
 };
@@ -54,7 +55,10 @@ where
     let mut hdr_buf = [0u8; LINK_HEADER_SIZE];
     stream.read_exact(&mut hdr_buf).await?;
     let hdr = LinkHeader::decode(&hdr_buf)?;
-    let mut mess_buf = vec![0u8; hdr.size as usize];
+    // Hostile client could send `size = 0xFFFFFFFF` and OOM the host
+    // before authentication has run; cap to MAX_LINK_PAYLOAD.
+    let mess_size = bounded_size(hdr.size, MAX_LINK_PAYLOAD)?;
+    let mut mess_buf = vec![0u8; mess_size];
     stream.read_exact(&mut mess_buf).await?;
     let mess = LinkMess::decode(&mess_buf)?;
 
@@ -187,5 +191,41 @@ mod tests {
             client_res,
             Err(NetError::Link(LinkError::PermissionDenied))
         ));
+    }
+
+    /// Pre-auth allocation DoS regression: a hostile client sends a
+    /// LinkHeader with `size = 0xFFFFFFFF`. Without the
+    /// MAX_LINK_PAYLOAD cap this would `vec![0u8; 4_294_967_295]` and
+    /// OOM the host before validating anything else.
+    #[tokio::test]
+    async fn server_rejects_oversized_link_payload_pre_auth() {
+        use tokio::io::AsyncWriteExt;
+        let mut rng = OsRng;
+        let priv_key = RsaPrivateKey::new(&mut rng, 1024).unwrap();
+
+        let (mut client, server) = duplex(8192);
+        let server_task = tokio::spawn(async move {
+            let opts = ServerLinkOptions::new(&priv_key, "pw");
+            link_server(server, opts).await
+        });
+        // SPICE_MAGIC + version 2.2 + size = u32::MAX
+        let mut bogus_header = Vec::new();
+        bogus_header.extend_from_slice(&0x5144_4552u32.to_le_bytes()); // "REDQ"
+        bogus_header.extend_from_slice(&2u32.to_le_bytes()); // major
+        bogus_header.extend_from_slice(&2u32.to_le_bytes()); // minor
+        bogus_header.extend_from_slice(&u32::MAX.to_le_bytes()); // size
+        client.write_all(&bogus_header).await.unwrap();
+        // Drop client to close the stream; server should error promptly
+        // rather than allocating 4 GiB and stalling.
+        drop(client);
+        let res = server_task.await.unwrap();
+        let err = res.err().expect("server should have errored, not accepted");
+        assert!(
+            matches!(
+                err,
+                NetError::Proto(capsaicin_proto::ProtoError::SizeTooLarge { .. })
+            ),
+            "expected SizeTooLarge, got {err:?}"
+        );
     }
 }

@@ -1,5 +1,6 @@
 //! Main-channel message bodies.
 
+use crate::limits::{MAX_CHANNELS_LIST, bounded_count};
 use crate::types::{ChannelId, Reader, Writer};
 use crate::Result;
 
@@ -53,7 +54,10 @@ pub struct ChannelsList {
 impl ChannelsList {
     pub fn decode(buf: &[u8]) -> Result<Self> {
         let mut r = Reader::new(buf);
-        let n = r.u32()? as usize;
+        // Bound the count before pre-allocating: a hostile server
+        // sending `n = 0xFFFFFFFF` would otherwise trigger an 8 GiB
+        // `Vec::with_capacity` and panic the client.
+        let n = bounded_count(r.u32()?, MAX_CHANNELS_LIST)?;
         let mut channels = Vec::with_capacity(n);
         for _ in 0..n {
             channels.push(ChannelId {

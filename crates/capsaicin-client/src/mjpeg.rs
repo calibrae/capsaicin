@@ -24,12 +24,28 @@ pub(crate) enum MjpegError {
     NoDimensions,
 }
 
+/// Hard cap on JPEG decoder working set. A malicious server could
+/// declare width=height=65535 and trigger ~16 GiB of allocations
+/// inside jpeg-decoder; this stops that.
+const MAX_MJPEG_MEMORY: usize = 64 * 1024 * 1024;
+/// Cap on either pixel dimension before we even try to allocate the
+/// BGRA expansion buffer.
+const MAX_MJPEG_DIM: u16 = 16384;
+
 pub(crate) fn decode(jpeg: &[u8]) -> Result<DecodedFrame, MjpegError> {
     let mut decoder = Decoder::new(jpeg);
+    decoder.set_max_decoding_buffer_size(MAX_MJPEG_MEMORY);
     let pixels = decoder.decode().map_err(|e| MjpegError::Jpeg(e.to_string()))?;
     let info = decoder.info().ok_or(MjpegError::NoDimensions)?;
     let (w, h) = (info.width, info.height);
-    let n = (w as usize) * (h as usize);
+    if w == 0 || h == 0 || w > MAX_MJPEG_DIM || h > MAX_MJPEG_DIM {
+        return Err(MjpegError::Jpeg(format!(
+            "frame dimensions {w}×{h} out of range"
+        )));
+    }
+    let n = (w as usize)
+        .checked_mul(h as usize)
+        .ok_or_else(|| MjpegError::Jpeg("pixel count overflow".into()))?;
     let bgra = match info.pixel_format {
         PixelFormat::RGB24 => {
             let mut out = vec![0u8; n * 4];
