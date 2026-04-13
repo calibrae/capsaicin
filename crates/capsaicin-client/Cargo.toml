@@ -1,0 +1,23 @@
+[package]
+name = "capsaicin-client"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Event-driven SPICE client for embedding in GUIs (e.g. virtmanager-rs)"
+
+[dependencies]
+capsaicin-proto = { workspace = true }
+capsaicin-net = { workspace = true }
+capsaicin-quic = { workspace = true }
+capsaicin-lz = { workspace = true }
+capsaicin-glz = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+jpeg-decoder = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["full", "test-util"] }
+capsaicin-server = { workspace = true }
+jpeg-encoder = "0.6"

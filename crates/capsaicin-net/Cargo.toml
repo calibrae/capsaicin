@@ -1,0 +1,20 @@
+[package]
+name = "capsaicin-net"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "SPICE link handshake driver and framing over tokio"
+
+[dependencies]
+capsaicin-proto = { workspace = true }
+bytes = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+rsa = { workspace = true }
+sha1 = { workspace = true }
+rand = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["full", "test-util"] }

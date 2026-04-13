@@ -1,0 +1,11 @@
+[package]
+name = "capsaicin-proto"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "SPICE wire protocol messages and parsing"
+
+[dependencies]
+bytes = { workspace = true }
+thiserror = { workspace = true }

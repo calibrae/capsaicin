@@ -1,0 +1,11 @@
+[package]
+name = "capsaicin-glz"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Pure-Rust decoder for SPICE GLZ (Group LZ) compressed images, including the per-session image dictionary. Standalone — no SPICE wire-format dependencies."
+
+[dependencies]
+thiserror = { workspace = true }
+capsaicin-lz = { workspace = true }

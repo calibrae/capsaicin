@@ -1,0 +1,19 @@
+[package]
+name = "capsaicin-server"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Embeddable SPICE server core"
+
+[dependencies]
+capsaicin-proto = { workspace = true }
+capsaicin-net = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+rsa = { workspace = true }
+rand = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["full", "test-util"] }

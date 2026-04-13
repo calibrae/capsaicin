@@ -1,0 +1,22 @@
+[package]
+name = "capsaicin-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "SPICE test client + server CLI for capsaicin"
+
+[[bin]]
+name = "capsaicin"
+path = "src/main.rs"
+
+[dependencies]
+capsaicin-proto = { workspace = true }
+capsaicin-net = { workspace = true }
+capsaicin-server = { workspace = true }
+capsaicin-client = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+winit = "0.30"
+softbuffer = "0.4"

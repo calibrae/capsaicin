@@ -1,0 +1,10 @@
+[package]
+name = "capsaicin-quic"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Pure-Rust decoder for SPICE QUIC (Quantized Universal Image Coder) compressed images. Standalone — no SPICE wire-format dependencies."
+
+[dependencies]
+thiserror = { workspace = true }

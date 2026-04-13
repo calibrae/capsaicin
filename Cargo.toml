@@ -1,0 +1,36 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/capsaicin-proto",
+    "crates/capsaicin-net",
+    "crates/capsaicin-server",
+    "crates/capsaicin-client",
+    "crates/capsaicin-cli",
+    "crates/capsaicin-quic",
+    "crates/capsaicin-lz",
+    "crates/capsaicin-glz",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/calii/capsaicin"
+
+[workspace.dependencies]
+bytes = "1.7"
+thiserror = "1"
+tokio = { version = "1", features = ["full"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+rsa = { version = "0.9", features = ["sha1"] }
+sha1 = "0.10"
+rand = "0.8"
+capsaicin-proto = { path = "crates/capsaicin-proto" }
+capsaicin-net = { path = "crates/capsaicin-net" }
+capsaicin-server = { path = "crates/capsaicin-server" }
+capsaicin-client = { path = "crates/capsaicin-client" }
+capsaicin-quic = { path = "crates/capsaicin-quic" }
+capsaicin-lz = { path = "crates/capsaicin-lz" }
+capsaicin-glz = { path = "crates/capsaicin-glz" }
+jpeg-decoder = { version = "0.3", default-features = false }
