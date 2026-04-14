@@ -1,14 +1,13 @@
 //! Inputs-channel task: receives [`InputEvent`]s from the embedder and
 //! forwards them to the server, and drains server-sent control messages.
 
-use capsaicin_net::Channel;
+use capsaicin_net::{Channel, SpiceStream};
 use capsaicin_proto::common;
 use capsaicin_proto::enums::{msg as common_msg, msgc as common_msgc};
 use capsaicin_proto::inputs::{
     self, KeyCode, KeyModifiers, MouseButton, MouseMotion, MousePosition, client_msg,
 };
 use capsaicin_proto::types::Writer;
-use tokio::net::TcpStream;
 use tokio::sync::mpsc;
 
 use crate::events::InputEvent;
@@ -16,7 +15,7 @@ use crate::events::InputEvent;
 /// Run the inputs channel: multiplex outbound InputEvent sends with
 /// inbound server messages.
 pub(crate) async fn run(
-    mut channel: Channel<TcpStream>,
+    mut channel: Channel<SpiceStream>,
     mut input_rx: mpsc::Receiver<InputEvent>,
 ) {
     loop {
@@ -49,7 +48,7 @@ pub(crate) async fn run(
 }
 
 async fn send_event(
-    channel: &mut Channel<TcpStream>,
+    channel: &mut Channel<SpiceStream>,
     evt: InputEvent,
 ) -> capsaicin_net::Result<()> {
     let (msg_type, body) = match evt {
@@ -120,7 +119,7 @@ async fn send_event(
 }
 
 async fn handle_server_msg(
-    channel: &mut Channel<TcpStream>,
+    channel: &mut Channel<SpiceStream>,
     msg: capsaicin_net::Message,
 ) -> capsaicin_net::Result<()> {
     match msg.msg_type {

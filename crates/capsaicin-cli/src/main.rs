@@ -3,6 +3,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use capsaicin_client::{ClientEvent, DisplayEvent, SpiceClient};
+use capsaicin_net::{TlsConfig, parse_fingerprint};
 use capsaicin_proto::enums::ChannelType;
 use capsaicin_server::{Server, default_channels, serve_main_bootstrap};
 
@@ -14,9 +15,19 @@ const USAGE: &str = "\
 capsaicin — SPICE test client / server / viewer
 
 USAGE:
-  capsaicin connect <host:port> [--password PW]
+  capsaicin connect <host:port> [--password PW] [TLS-FLAGS]
   capsaicin serve   <bind:port> [--password PW]
-  capsaicin view    <host:port> [--password PW]
+  capsaicin view    <host:port> [--password PW] [TLS-FLAGS]
+
+TLS-FLAGS (client):
+  --tls                  force TLS (no plain fallback)
+  --no-tls               force plain TCP (skip TLS probe)
+  --ca-file PATH         PEM CA bundle to verify server cert
+  --fingerprint HEX      pin SHA256 of server leaf cert (aa:bb:.. or 64 hex)
+  --insecure             skip certificate verification (loud warning)
+
+  Default: try TLS first, fall back to plain TCP on handshake failure.
+  --ca-file / --fingerprint / --insecure imply --tls.
 
 ENV:
   RUST_LOG   logging filter (default: info)
@@ -50,8 +61,10 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     match subcommand.as_str() {
         "connect" => {
             let addr = args.next().unwrap_or_else(|| print_usage_and_exit());
-            let password = parse_password_flag(args).unwrap_or_default();
-            connect_flow(&addr, &password).await
+            let rest: Vec<String> = args.collect();
+            let password = parse_password_flag(rest.iter().cloned()).unwrap_or_default();
+            let policy = parse_tls_policy(&rest)?;
+            connect_flow(&addr, &password, policy).await
         }
         "serve" => {
             let addr = args.next().unwrap_or_else(|| print_usage_and_exit());
@@ -79,11 +92,13 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         }
         "view" => {
             let addr = args.next().unwrap_or_else(|| print_usage_and_exit());
-            let password = parse_password_flag(args).unwrap_or_default();
+            let rest: Vec<String> = args.collect();
+            let password = parse_password_flag(rest.iter().cloned()).unwrap_or_default();
+            let policy = parse_tls_policy(&rest)?;
             // The viewer creates its own tokio runtime in a sidecar
             // thread and owns the main thread for winit. We invoke it
             // synchronously here.
-            viewer::run(&addr, &password)
+            viewer::run(&addr, &password, policy)
         }
         "-h" | "--help" | "help" => {
             print!("{USAGE}");
@@ -120,9 +135,110 @@ fn print_usage_and_exit() -> ! {
     std::process::exit(2);
 }
 
-async fn connect_flow(addr: &str, password: &str) -> Result<(), Box<dyn std::error::Error>> {
+/// What transport the user asked for.
+#[derive(Debug, Clone)]
+pub(crate) enum TlsPolicy {
+    /// Try TLS first, fall back to plain TCP on handshake failure. Default.
+    Auto(TlsConfig),
+    /// Force TLS, no fallback.
+    Tls(TlsConfig),
+    /// Force plain TCP, skip TLS probe.
+    Plain,
+}
+
+/// Parse `--tls / --no-tls / --ca-file / --fingerprint / --insecure`.
+pub(crate) fn parse_tls_policy(args: &[String]) -> Result<TlsPolicy, Box<dyn std::error::Error>> {
+    let mut force_tls = false;
+    let mut force_plain = false;
+    let mut cfg: Option<TlsConfig> = None;
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--tls" => force_tls = true,
+            "--no-tls" => force_plain = true,
+            "--insecure" => cfg = Some(TlsConfig::Insecure),
+            "--ca-file" => {
+                let v = args
+                    .get(i + 1)
+                    .ok_or("--ca-file requires a path")?
+                    .clone();
+                cfg = Some(TlsConfig::CaFile(v));
+                i += 1;
+            }
+            "--fingerprint" => {
+                let v = args.get(i + 1).ok_or("--fingerprint requires a value")?;
+                cfg = Some(TlsConfig::Fingerprint(parse_fingerprint(v)?));
+                i += 1;
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    if force_plain && (force_tls || cfg.is_some()) {
+        return Err("--no-tls is incompatible with TLS flags".into());
+    }
+    if force_plain {
+        return Ok(TlsPolicy::Plain);
+    }
+    let cfg = cfg.unwrap_or(TlsConfig::SystemRoots);
+    if force_tls || matches!(cfg, TlsConfig::Insecure | TlsConfig::CaFile(_) | TlsConfig::Fingerprint(_)) {
+        Ok(TlsPolicy::Tls(cfg))
+    } else {
+        Ok(TlsPolicy::Auto(cfg))
+    }
+}
+
+/// Connect honouring the TLS policy. For `Auto`, try TLS first; if the
+/// TLS handshake fails (server doesn't speak TLS), reconnect plain.
+pub(crate) async fn connect_with_policy(
+    addr: &str,
+    password: &str,
+    policy: TlsPolicy,
+) -> Result<SpiceClient, capsaicin_client::ClientError> {
+    match policy {
+        TlsPolicy::Plain => {
+            tracing::info!(%addr, "connecting plain TCP");
+            SpiceClient::connect(addr, password).await
+        }
+        TlsPolicy::Tls(cfg) => {
+            tracing::info!(%addr, "connecting TLS");
+            SpiceClient::connect_tls(addr, password, cfg).await
+        }
+        TlsPolicy::Auto(cfg) => {
+            tracing::info!(%addr, "auto-detect: trying TLS first");
+            match SpiceClient::connect_tls(addr, password, cfg).await {
+                Ok(c) => Ok(c),
+                Err(e) if looks_like_tls_handshake_failure(&e) => {
+                    tracing::info!(%e, "TLS probe failed, falling back to plain TCP");
+                    SpiceClient::connect(addr, password).await
+                }
+                Err(e) => Err(e),
+            }
+        }
+    }
+}
+
+/// Heuristic: distinguish "server doesn't speak TLS" from "auth /
+/// protocol error after a successful TLS handshake". We only fall back
+/// for the former.
+fn looks_like_tls_handshake_failure(err: &capsaicin_client::ClientError) -> bool {
+    use capsaicin_client::ClientError;
+    let s = err.to_string().to_lowercase();
+    matches!(err, ClientError::Net(_))
+        && (s.contains("tls handshake")
+            || s.contains("invalid sni")
+            || s.contains("unexpected eof")
+            || s.contains("connection reset")
+            || s.contains("decrypt"))
+}
+
+async fn connect_flow(
+    addr: &str,
+    password: &str,
+    policy: TlsPolicy,
+) -> Result<(), Box<dyn std::error::Error>> {
     tracing::info!(%addr, "connecting as SPICE client");
-    let mut client = SpiceClient::connect(addr, password).await?;
+    let mut client = connect_with_policy(addr, password, policy).await?;
     tracing::info!(session_id = client.session_id(), "SPICE client connected");
 
     let drain_secs: u64 = std::env::var("CAPSAICIN_DRAIN_SECS")

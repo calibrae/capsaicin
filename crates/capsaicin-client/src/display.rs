@@ -2,7 +2,7 @@
 
 use std::collections::HashMap;
 
-use capsaicin_net::{Channel, Message};
+use capsaicin_net::{Channel, Message, SpiceStream};
 use capsaicin_proto::common;
 use capsaicin_proto::display::{
     DisplayInit, Mode, MonitorsConfig, SurfaceCreate, SurfaceDestroy,
@@ -30,7 +30,6 @@ use capsaicin_proto::types::Rect as ProtoRect;
 use crate::mjpeg;
 use capsaicin_proto::types::{Reader, Writer};
 use tokio::io::{AsyncRead, AsyncWrite};
-use tokio::net::TcpStream;
 use tokio::sync::mpsc;
 
 use crate::events::{ClientEvent, DisplayEvent, RegionPixels, SurfaceFormat};
@@ -136,7 +135,7 @@ struct StreamInfo {
 
 /// Long-running task: pull messages, translate to events.
 pub(crate) async fn run(
-    mut channel: Channel<TcpStream>,
+    mut channel: Channel<SpiceStream>,
     events_tx: mpsc::Sender<ClientEvent>,
 ) {
     let mut state = DisplayState::default();
@@ -159,7 +158,7 @@ pub(crate) async fn run(
 }
 
 async fn handle(
-    channel: &mut Channel<TcpStream>,
+    channel: &mut Channel<SpiceStream>,
     state: &mut DisplayState,
     msg: Message,
     events_tx: &mpsc::Sender<ClientEvent>,

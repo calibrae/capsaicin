@@ -23,8 +23,9 @@ use std::sync::mpsc as std_mpsc;
 use std::time::Duration;
 
 use capsaicin_client::{
-    ClientEvent, ClientError, DisplayEvent, InputEvent, Rect, RegionPixels, SpiceClient,
+    ClientEvent, ClientError, DisplayEvent, InputEvent, Rect, RegionPixels,
 };
+use crate::{TlsPolicy, connect_with_policy};
 use capsaicin_proto::inputs::{button as spice_button, button_mask};
 use softbuffer::Surface;
 use tokio::sync::mpsc as tokio_mpsc;
@@ -48,7 +49,7 @@ enum PaintMsg {
 
 /// Public entry point. Blocks until the window is closed or the SPICE
 /// connection drops.
-pub fn run(addr: &str, password: &str) -> Result<(), Box<dyn std::error::Error>> {
+pub fn run(addr: &str, password: &str, policy: TlsPolicy) -> Result<(), Box<dyn std::error::Error>> {
     let (paint_tx, paint_rx) = std_mpsc::channel::<PaintMsg>();
     let (input_tx, input_rx) = tokio_mpsc::channel::<InputEvent>(256);
 
@@ -73,7 +74,7 @@ pub fn run(addr: &str, password: &str) -> Result<(), Box<dyn std::error::Error>>
                     return;
                 }
             };
-            rt.block_on(spice_task(addr_owned, password_owned, paint_tx, input_rx));
+            rt.block_on(spice_task(addr_owned, password_owned, policy, paint_tx, input_rx));
         })
         .expect("spawn spice thread");
 
@@ -88,11 +89,12 @@ pub fn run(addr: &str, password: &str) -> Result<(), Box<dyn std::error::Error>>
 async fn spice_task(
     addr: String,
     password: String,
+    policy: TlsPolicy,
     paint_tx: std_mpsc::Sender<PaintMsg>,
     mut input_rx: tokio_mpsc::Receiver<InputEvent>,
 ) {
     tracing::info!(%addr, "viewer: connecting");
-    let mut client = match SpiceClient::connect(&addr, &password).await {
+    let mut client = match connect_with_policy(&addr, &password, policy).await {
         Ok(c) => c,
         Err(e) => {
             let _ = paint_tx.send(PaintMsg::Closed { error: Some(e) });

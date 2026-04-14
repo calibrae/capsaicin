@@ -1,11 +1,10 @@
 //! `SpiceClient` — top-level connection object used by the embedder.
 
-use capsaicin_net::{Channel, MainConnection, connect_sub_channel};
+use capsaicin_net::{Channel, MainConnection, SpiceStream, TlsConfig, connect_sub_channel};
 use capsaicin_proto::caps::CapSet;
 use capsaicin_proto::common;
 use capsaicin_proto::enums::{ChannelType, msg as common_msg, msgc as common_msgc};
 use capsaicin_proto::types::Writer;
-use tokio::net::TcpStream;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 
@@ -65,7 +64,16 @@ impl SpiceClientBuilder {
     }
 
     pub async fn connect(self, addr: &str, password: &str) -> Result<SpiceClient> {
-        SpiceClient::connect_with(self, addr, password).await
+        SpiceClient::connect_with(self, addr, password, None).await
+    }
+
+    pub async fn connect_tls(
+        self,
+        addr: &str,
+        password: &str,
+        tls: TlsConfig,
+    ) -> Result<SpiceClient> {
+        SpiceClient::connect_with(self, addr, password, Some(tls)).await
     }
 }
 
@@ -86,13 +94,28 @@ impl SpiceClient {
         SpiceClientBuilder::new().connect(addr, password).await
     }
 
+    /// Shortcut for the default builder with TLS.
+    pub async fn connect_tls(addr: &str, password: &str, tls: TlsConfig) -> Result<Self> {
+        SpiceClientBuilder::new()
+            .connect_tls(addr, password, tls)
+            .await
+    }
+
     pub fn builder() -> SpiceClientBuilder {
         SpiceClientBuilder::new()
     }
 
-    async fn connect_with(cfg: SpiceClientBuilder, addr: &str, password: &str) -> Result<Self> {
+    async fn connect_with(
+        cfg: SpiceClientBuilder,
+        addr: &str,
+        password: &str,
+        tls: Option<TlsConfig>,
+    ) -> Result<Self> {
         // 1. Main channel + bootstrap.
-        let main = MainConnection::connect(addr, password).await?;
+        let main = match tls.clone() {
+            Some(cfg) => MainConnection::connect_tls(addr, password, cfg).await?,
+            None => MainConnection::connect(addr, password).await?,
+        };
         let session_id = main.session_id;
         let advertised: Vec<u8> = main
             .available_channels
@@ -119,6 +142,7 @@ impl SpiceClient {
                 0,
                 password,
                 CapSet::new(),
+                tls.clone(),
             )
             .await?;
             display::send_init(&mut ch).await?;
@@ -136,6 +160,7 @@ impl SpiceClient {
                     0,
                     password,
                     CapSet::new(),
+                    tls.clone(),
                 )
                 .await?,
             )
@@ -222,7 +247,7 @@ impl Drop for SpiceClient {
 
 /// Long-running task for the main channel: answer pings / acks, swallow
 /// notifies. Emits `ClientEvent::Closed` when the socket drops.
-async fn run_main(mut channel: Channel<TcpStream>, events_tx: mpsc::Sender<ClientEvent>) {
+async fn run_main(mut channel: Channel<SpiceStream>, events_tx: mpsc::Sender<ClientEvent>) {
     let mut ack_window: u32 = 0;
     let mut ack_remaining: u32 = 0;
     loop {

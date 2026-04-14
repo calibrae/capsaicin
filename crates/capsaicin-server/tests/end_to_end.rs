@@ -111,10 +111,17 @@ async fn client_can_open_inputs_and_display_sub_channels() {
     let addr_s = addr.to_string();
     let main = MainConnection::connect(&addr_s, "pw").await.unwrap();
 
-    let inputs =
-        connect_sub_channel(&addr_s, main.session_id, ChannelType::Inputs, 0, "pw", CapSet::new())
-            .await
-            .expect("inputs sub-channel");
+    let inputs = connect_sub_channel(
+        &addr_s,
+        main.session_id,
+        ChannelType::Inputs,
+        0,
+        "pw",
+        CapSet::new(),
+        None,
+    )
+    .await
+    .expect("inputs sub-channel");
     let display = connect_sub_channel(
         &addr_s,
         main.session_id,
@@ -122,6 +129,7 @@ async fn client_can_open_inputs_and_display_sub_channels() {
         0,
         "pw",
         CapSet::new(),
+        None,
     )
     .await
     .expect("display sub-channel");
@@ -192,6 +200,7 @@ async fn input_events_round_trip_over_inputs_channel() {
         0,
         "pw",
         CapSet::new(),
+        None,
     )
     .await
     .unwrap();

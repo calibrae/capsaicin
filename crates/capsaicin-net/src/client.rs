@@ -11,7 +11,8 @@ use capsaicin_proto::types::{ChannelId, Writer};
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::TcpStream;
 
-use crate::{Channel, LinkOptions, NetError, Result, link_client};
+use crate::{Channel, LinkOptions, NetError, Result, SpiceStream, TlsConfig, link_client};
+use crate::tls::connect_tls;
 
 /// Main channel after bootstrap: `Init` read, channel list discovered,
 /// ready to reply to subsequent ACK/PING messages.
@@ -22,7 +23,7 @@ pub struct MainConnection<S> {
     pub available_channels: Vec<ChannelId>,
 }
 
-impl MainConnection<TcpStream> {
+impl MainConnection<SpiceStream> {
     /// Dial a SPICE server over plain TCP, run the main-channel bootstrap,
     /// and return the populated [`MainConnection`].
     pub async fn connect(addr: &str, password: &str) -> Result<Self> {
@@ -30,7 +31,16 @@ impl MainConnection<TcpStream> {
         stream.set_nodelay(true)?;
         let mut opts = LinkOptions::new(ChannelType::Main);
         opts.password = password;
-        let channel = link_client(stream, opts).await?;
+        let channel = link_client(SpiceStream::Plain(stream), opts).await?;
+        Self::bootstrap(channel).await
+    }
+
+    /// Dial a SPICE server over TLS and run the main-channel bootstrap.
+    pub async fn connect_tls(addr: &str, password: &str, tls: TlsConfig) -> Result<Self> {
+        let stream = connect_tls(addr, tls).await?;
+        let mut opts = LinkOptions::new(ChannelType::Main);
+        opts.password = password;
+        let channel = link_client(SpiceStream::Tls(Box::new(stream)), opts).await?;
         Self::bootstrap(channel).await
     }
 }
@@ -119,7 +129,8 @@ where
 }
 
 /// Open a sub-channel TCP connection and complete the link handshake, using
-/// the `session_id` that was handed out on the main channel.
+/// the `session_id` that was handed out on the main channel. If `tls` is
+/// `Some`, the underlying socket is wrapped in TLS first.
 pub async fn connect_sub_channel(
     addr: &str,
     session_id: u32,
@@ -127,9 +138,16 @@ pub async fn connect_sub_channel(
     channel_id: u8,
     password: &str,
     channel_caps: CapSet,
-) -> Result<Channel<TcpStream>> {
-    let stream = TcpStream::connect(addr).await?;
-    stream.set_nodelay(true)?;
+    tls: Option<TlsConfig>,
+) -> Result<Channel<SpiceStream>> {
+    let stream = match tls {
+        Some(cfg) => SpiceStream::Tls(Box::new(connect_tls(addr, cfg).await?)),
+        None => {
+            let s = TcpStream::connect(addr).await?;
+            s.set_nodelay(true)?;
+            SpiceStream::Plain(s)
+        }
+    };
     let mut opts = LinkOptions::new(channel_type);
     opts.connection_id = session_id;
     opts.channel_id = channel_id;
