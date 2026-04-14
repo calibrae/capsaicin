@@ -6,7 +6,7 @@ use capsaicin_proto::enums::{
     ChannelType, main_msg, main_msgc, msg as common_msg, msgc as common_msgc,
 };
 use capsaicin_proto::common;
-use capsaicin_proto::main_chan::{ChannelsList, Init};
+use capsaicin_proto::main_chan::{ChannelsList, Init, MouseModeRequest, mouse_mode};
 use capsaicin_proto::types::{ChannelId, Writer};
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::TcpStream;
@@ -83,7 +83,24 @@ where
                     // Advisory, ignore for now.
                 }
                 main_msg::INIT => {
-                    init = Some(Init::decode(&msg.body)?);
+                    let parsed = Init::decode(&msg.body)?;
+                    // Request CLIENT mouse mode if the guest supports
+                    // it. SERVER mode silently drops absolute
+                    // MousePosition events, so CLIENT is strictly
+                    // better UX whenever a tablet-style input device
+                    // is available. The server replies with a
+                    // MAIN_MOUSE_MODE carrying the mode it actually
+                    // chose (falls back to SERVER if no tablet).
+                    if parsed.supported_mouse_modes & mouse_mode::CLIENT != 0
+                        && parsed.current_mouse_mode != mouse_mode::CLIENT
+                    {
+                        let mut w = Writer::new();
+                        MouseModeRequest { mode: mouse_mode::CLIENT }.encode(&mut w);
+                        channel
+                            .write_message(main_msgc::MOUSE_MODE_REQUEST, w.as_slice())
+                            .await?;
+                    }
+                    init = Some(parsed);
                     // MSGC_MAIN_CLIENT_INFO is deprecated (removed in
                     // modern SPICE); sending it causes QEMU to drop the
                     // connection. Go straight to ATTACH_CHANNELS.

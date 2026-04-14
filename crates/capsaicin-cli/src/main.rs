@@ -253,6 +253,12 @@ async fn connect_flow(
         }
         match tokio::time::timeout(remaining, client.next_event()).await {
             Ok(Some(ClientEvent::Display(evt))) => log_display_event(&evt),
+            Ok(Some(ClientEvent::Cursor(evt))) => {
+                tracing::debug!(?evt, "cursor event")
+            }
+            Ok(Some(ClientEvent::MouseMode(mode))) => {
+                tracing::info!(?mode, "mouse mode")
+            }
             Ok(Some(ClientEvent::Closed(err))) => {
                 tracing::warn!(?err, "client closed");
                 break;

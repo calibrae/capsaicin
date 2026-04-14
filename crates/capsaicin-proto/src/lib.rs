@@ -7,6 +7,7 @@
 
 pub mod caps;
 pub mod common;
+pub mod cursor;
 pub mod display;
 pub mod draw;
 pub mod image;

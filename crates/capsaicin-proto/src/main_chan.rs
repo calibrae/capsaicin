@@ -118,6 +118,27 @@ impl MouseMode {
     }
 }
 
+/// `SPICE_MSGC_MAIN_MOUSE_MODE_REQUEST` — client asks the server to
+/// switch mouse reporting mode. The server responds with a
+/// `SPICE_MSG_MAIN_MOUSE_MODE` carrying the mode it actually picked
+/// (may differ from the request if the guest can't support it — e.g.
+/// CLIENT requires an absolute pointing device like `usb-tablet`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MouseModeRequest {
+    pub mode: u32,
+}
+
+impl MouseModeRequest {
+    pub fn decode(buf: &[u8]) -> Result<Self> {
+        let mut r = Reader::new(buf);
+        Ok(Self { mode: r.u32()? })
+    }
+
+    pub fn encode(&self, w: &mut Writer) {
+        w.u32(self.mode);
+    }
+}
+
 /// `SPICE_MSG_MAIN_MULTI_MEDIA_TIME`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct MultiMediaTime {

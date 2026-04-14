@@ -3,14 +3,15 @@
 use capsaicin_net::{Channel, MainConnection, SpiceStream, TlsConfig, connect_sub_channel};
 use capsaicin_proto::caps::CapSet;
 use capsaicin_proto::common;
-use capsaicin_proto::enums::{ChannelType, msg as common_msg, msgc as common_msgc};
+use capsaicin_proto::enums::{ChannelType, main_msg, msg as common_msg, msgc as common_msgc};
+use capsaicin_proto::main_chan;
 use capsaicin_proto::types::Writer;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 
 use crate::error::{ClientError, Result};
-use crate::events::{ClientEvent, InputEvent};
-use crate::{display, inputs};
+use crate::events::{ClientEvent, InputEvent, MouseMode};
+use crate::{cursor, display, inputs};
 
 /// Size of the internal event / input mailboxes. Generous enough that a
 /// UI thread will not stall a GPU-backed stream of draws, small enough
@@ -21,6 +22,7 @@ const CHANNEL_CAPACITY: usize = 256;
 pub struct SpiceClientBuilder {
     attach_display: bool,
     attach_inputs: bool,
+    attach_cursor: bool,
     event_capacity: usize,
     input_capacity: usize,
 }
@@ -30,6 +32,7 @@ impl Default for SpiceClientBuilder {
         Self {
             attach_display: true,
             attach_inputs: true,
+            attach_cursor: true,
             event_capacity: CHANNEL_CAPACITY,
             input_capacity: CHANNEL_CAPACITY,
         }
@@ -50,6 +53,14 @@ impl SpiceClientBuilder {
     /// Open the inputs sub-channel. Defaults to true.
     pub fn inputs(mut self, v: bool) -> Self {
         self.attach_inputs = v;
+        self
+    }
+
+    /// Open the cursor sub-channel. Defaults to true. In SERVER mouse
+    /// mode the guest does not paint the cursor into the framebuffer,
+    /// so turning this off means the user sees no cursor at all.
+    pub fn cursor(mut self, v: bool) -> Self {
+        self.attach_cursor = v;
         self
     }
 
@@ -125,12 +136,21 @@ impl SpiceClient {
 
         let has_display = advertised.contains(&(ChannelType::Display as u8));
         let has_inputs = advertised.contains(&(ChannelType::Inputs as u8));
+        let has_cursor = advertised.contains(&(ChannelType::Cursor as u8));
 
         if cfg.attach_display && !has_display {
             return Err(ClientError::MissingChannel("display"));
         }
         if cfg.attach_inputs && !has_inputs {
             return Err(ClientError::MissingChannel("inputs"));
+        }
+        // Cursor is soft-required: in CLIENT mouse mode the local OS
+        // paints the cursor, so its absence is only a problem in SERVER
+        // mode. Log and carry on rather than refuse to connect.
+        if cfg.attach_cursor && !has_cursor {
+            tracing::warn!(
+                "server did not advertise cursor channel — cursor will be invisible in SERVER mouse mode"
+            );
         }
 
         // 2. Open sub-channels eagerly (keep the main session alive).
@@ -168,9 +188,35 @@ impl SpiceClient {
             None
         };
 
+        let cursor_channel = if cfg.attach_cursor && has_cursor {
+            Some(
+                connect_sub_channel(
+                    addr,
+                    session_id,
+                    ChannelType::Cursor,
+                    0,
+                    password,
+                    CapSet::new(),
+                    tls.clone(),
+                )
+                .await?,
+            )
+        } else {
+            None
+        };
+
         // 3. Mailboxes for the public API.
         let (events_tx, events_rx) = mpsc::channel(cfg.event_capacity);
         let (input_tx, input_rx) = mpsc::channel(cfg.input_capacity);
+
+        // Seed the event stream with the mouse mode reported in Init,
+        // so the embedder can pick its input strategy before the first
+        // MOUSE_MODE message (which the server only sends on change).
+        let _ = events_tx
+            .send(ClientEvent::MouseMode(MouseMode::from_raw(
+                main.init.current_mouse_mode,
+            )))
+            .await;
 
         // 4. Spawn per-channel tasks.
         let mut tasks = Vec::new();
@@ -182,6 +228,11 @@ impl SpiceClient {
         if let Some(ch) = display_channel {
             let tx = events_tx.clone();
             tasks.push(tokio::spawn(display::run(ch, tx)));
+        }
+
+        if let Some(ch) = cursor_channel {
+            let tx = events_tx.clone();
+            tasks.push(tokio::spawn(cursor::run(ch, tx)));
         }
 
         let input_tx_ret = if let Some(ch) = inputs_channel {
@@ -297,6 +348,14 @@ async fn run_main(mut channel: Channel<SpiceStream>, events_tx: mpsc::Sender<Cli
                 }
                 ack_window = ack.window;
                 ack_remaining = ack.window;
+            }
+            main_msg::MOUSE_MODE => {
+                let Ok(mm) = main_chan::MouseMode::decode(&msg.body) else {
+                    continue;
+                };
+                let _ = events_tx
+                    .send(ClientEvent::MouseMode(MouseMode::from_raw(mm.current_mode)))
+                    .await;
             }
             _ => {
                 tracing::trace!(msg_type = msg.msg_type, "main: ignored");

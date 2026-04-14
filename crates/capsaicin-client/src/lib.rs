@@ -22,6 +22,7 @@
 //! ```
 
 mod client;
+mod cursor;
 mod display;
 mod error;
 mod events;
@@ -32,4 +33,7 @@ pub use capsaicin_proto::display::{Head as MonitorHead, SurfaceCreate};
 pub use capsaicin_proto::stream::VideoCodec;
 pub use client::{SpiceClient, SpiceClientBuilder};
 pub use error::{ClientError, Result};
-pub use events::{ClientEvent, DisplayEvent, InputEvent, Rect, RegionPixels, SurfaceFormat};
+pub use events::{
+    ClientEvent, CursorEvent, DisplayEvent, InputEvent, MouseMode, Rect, RegionPixels,
+    SurfaceFormat,
+};

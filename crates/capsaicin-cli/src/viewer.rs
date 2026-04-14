@@ -115,6 +115,12 @@ async fn spice_task(
                             }
                         }
                     }
+                    Some(ClientEvent::MouseMode(mode)) => {
+                        tracing::info!(?mode, "viewer: mouse mode");
+                    }
+                    Some(ClientEvent::Cursor(evt)) => {
+                        tracing::debug!(?evt, "viewer: cursor event");
+                    }
                     Some(ClientEvent::Closed(err)) => {
                         let _ = paint_tx.send(PaintMsg::Closed { error: err });
                         break;

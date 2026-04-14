@@ -11,8 +11,78 @@ use crate::error::ClientError;
 pub enum ClientEvent {
     /// Display-channel event (framebuffer / surface lifecycle).
     Display(DisplayEvent),
+    /// Cursor sprite / position / visibility update.
+    Cursor(CursorEvent),
+    /// Server switched mouse reporting mode. The embedder must look at
+    /// this to decide whether to send `MousePosition` (CLIENT mode) or
+    /// `MouseMotion` (SERVER mode).
+    MouseMode(MouseMode),
     /// Connection ended — either cleanly (`None`) or with an error.
     Closed(Option<ClientError>),
+}
+
+/// Cursor-channel events.
+#[derive(Debug, Clone)]
+pub enum CursorEvent {
+    /// New cursor sprite. Embedder should cache by `unique` if
+    /// `cacheable` is true — the server may later send a bare
+    /// `SetFromCache { unique }` referring to it.
+    Set {
+        x: i32,
+        y: i32,
+        hot_x: u16,
+        hot_y: u16,
+        width: u16,
+        height: u16,
+        /// Argb8888 pixels, top-down, stride `width * 4`. Empty if
+        /// `kind` isn't one we decode (e.g. legacy monochrome).
+        pixels: Vec<u8>,
+        /// Identifier the server uses to refer to this sprite later if
+        /// it chooses to cache it.
+        unique: u64,
+        /// Whether the server asked us to cache this one (flag
+        /// `CACHE_ME`).
+        cacheable: bool,
+        visible: bool,
+    },
+    /// Server referred to a previously-cached sprite. Embedder should
+    /// look up `unique` and reuse its pixels.
+    SetFromCache {
+        x: i32,
+        y: i32,
+        unique: u64,
+        visible: bool,
+    },
+    /// Move the cursor without changing the sprite.
+    Move { x: i32, y: i32 },
+    /// Hide the cursor.
+    Hide,
+    /// Drop the cached sprite keyed by `unique`.
+    InvalidateOne { unique: u64 },
+    /// Drop all cached sprites.
+    InvalidateAll,
+}
+
+/// Mouse reporting mode negotiated on the main channel.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MouseMode {
+    /// Guest has an absolute pointing device (usb-tablet /
+    /// virtio-tablet). Send `InputEvent::MousePosition`.
+    Client,
+    /// No absolute device; guest wants relative deltas. Send
+    /// `InputEvent::MouseMotion` driven from pointer-lock or similar.
+    Server,
+}
+
+impl MouseMode {
+    pub fn from_raw(v: u32) -> Self {
+        use capsaicin_proto::main_chan::mouse_mode;
+        if v & mouse_mode::CLIENT != 0 {
+            Self::Client
+        } else {
+            Self::Server
+        }
+    }
 }
 
 /// Surface pixel format as exposed to the embedder.
