@@ -9,6 +9,7 @@ members = [
     "crates/capsaicin-quic",
     "crates/capsaicin-lz",
     "crates/capsaicin-glz",
+    "crates/capsaicin-wasm",
 ]
 
 [workspace.package]

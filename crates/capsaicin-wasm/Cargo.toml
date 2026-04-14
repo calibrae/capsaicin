@@ -1,0 +1,26 @@
+[package]
+name = "capsaicin-wasm"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "WebAssembly bindings for capsaicin's SPICE image codecs (LZ, GLZ, QUIC). Drop-in replacement for the C decoders shipped with spice-html5."
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+capsaicin-lz = { workspace = true }
+capsaicin-glz = { workspace = true }
+capsaicin-quic = { workspace = true }
+wasm-bindgen = "0.2"
+
+[features]
+default = []
+# Enable `console_error_panic_hook` for readable panics in the JS console.
+# Adds ~2 KiB to the bundle; off by default.
+panic_hook = ["dep:console_error_panic_hook"]
+
+[dependencies.console_error_panic_hook]
+version = "0.1"
+optional = true
